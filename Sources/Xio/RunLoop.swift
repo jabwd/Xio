@@ -7,15 +7,21 @@
 
 import Foundation
 
+enum RunLoopProviderError: Error {
+    case failed
+}
+
 enum EventType {
     case read
     case write
     case except
 }
 
-struct Selectable: Hashable {
-    let fileDescriptor: Int32
-    let eventTypes: [EventType]
+protocol Selectable {
+    var fileDescriptor: Int32 { get }
+    var eventTypes: [EventType] { get }
+    
+    func event(type: EventType) async
 }
 
 struct SelectableEvent {
@@ -29,7 +35,7 @@ struct RunLoopTimeout {
 }
 
 protocol RunLoopProvider {
-    func run(timeout: RunLoopTimeout?) -> [SelectableEvent]
+    func run(timeout: RunLoopTimeout?) throws -> [SelectableEvent]
     func register(selectable: Selectable)
     func deregister(selectable: Selectable)
 }
@@ -39,9 +45,13 @@ protocol RunLoopDelegate {
     func event(type: EventType)
 }
 
+enum RunLoopError: Error {
+    case unknownFD
+}
+
 actor RunLoop {
     let provider: RunLoopProvider
-    var selectables: [Selectable: RunLoopDelegate] = [:]
+    var selectables: [Int32: Selectable] = [:]
 
     init(provider: RunLoopProvider) {
         self.provider = provider
@@ -54,30 +64,48 @@ actor RunLoop {
         while ( true ) {
             i += 1
             
+            if Task.isCancelled {
+                break
+            }
+            
             // Stop execution after 10 seconds
             if (i > 10) {
                 break
             }
-            let events = provider.run(timeout: RunLoopTimeout(seconds: 1, nanoSeconds: 0))
+            let events = try provider.run(timeout: RunLoopTimeout(seconds: 10, nanoSeconds: 0))
             for event in events {
-                let selectable = selectables[event.fd]
-                
+                guard let selectable = selectables[event.fd] else {
+                    throw RunLoopError.unknownFD
+                }
+                for eventType in event.eventTypes {
+                    await selectable.event(type: eventType)
+                }
             }
-            print("events: \(events)")
+        }
+    }
+    
+    func run2() async throws {
+        let events = try provider.run(timeout: RunLoopTimeout(seconds: 10, nanoSeconds: 0))
+        for event in events {
+            guard let selectable = selectables[event.fd] else {
+                throw RunLoopError.unknownFD
+            }
+            for eventType in event.eventTypes {
+                await selectable.event(type: eventType)
+            }
         }
     }
     
     // MARK: -
     
-    func register(selectable: Selectable, delegate: RunLoopDelegate) {
+    func register(selectable: Selectable) {
+        print("Should register with run loop?")
         provider.register(selectable: selectable)
-        selectables[selectable] = delegate
+        selectables[selectable.fileDescriptor] = selectable
     }
     
     func deregister(selectable: Selectable) {
-        fatalError("Not implemented")
-//        selectables.removeAll { sel in
-//            sel.fileDescriptor == selectable.fileDescriptor
-//        }
+        provider.deregister(selectable: selectable)
+        selectables.removeValue(forKey: selectable.fileDescriptor)
     }
 }
